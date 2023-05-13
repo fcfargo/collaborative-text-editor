@@ -5,7 +5,9 @@ const morgan = require('morgan');
 const socketio = require('socket.io');
 const jwt = require('jsonwebtoken');
 const Automerge = require('@automerge/automerge');
-const redis = require('./db/redis');
+const mongodb = require('./db/mongo');
+const mongoose = require('mongoose');
+const { User, Doc, Change } = require('./db/mongo_models');
 const { body, validationResult } = require('express-validator');
 
 const app = express();
@@ -16,8 +18,8 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(morgan('tiny'));
 
-// redis 연결
-redis.init();
+// DB 연결
+mongodb.main().catch((err) => console.log(err));
 
 // 유저 정보 등록 api
 app.post('/signup', body('username').notEmpty().isString(), body('email').notEmpty().isEmail(), async (req, res) => {
@@ -30,12 +32,15 @@ app.post('/signup', body('username').notEmpty().isString(), body('email').notEmp
     const { username, email } = req.body;
 
     // 중복 이메일 체크
-    const cachedValue = await redis.client.get(email);
-    if (cachedValue) {
+    const foundUser = await User.findOne({ email });
+    if (foundUser) {
       return res.status(400).json({ success: false, message: '중복 이메일이 존재합니다.' });
     }
 
     const token = jwt.sign({ username, email }, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+    // 유저 정보 저장
+    await User.create({ username, email });
 
     /**
      * @typedef {Object} User
@@ -49,10 +54,7 @@ app.post('/signup', body('username').notEmpty().isString(), body('email').notEmp
      */
     const user = { username, email, token };
 
-    // 유저 정보 저장
-    redis.client.set(email, JSON.stringify(user));
-
-    return res.status(201).json({ success: true, result: { username, email, token } });
+    return res.status(201).json({ success: true, result: user });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ success: false });
@@ -112,8 +114,8 @@ io.of('/doc').on('connection', async (socket) => {
   const actorId = '0001';
 
   // 문서 정보 조회
-  const cachedDoc = await redis.client.get(actorId);
-  if (!cachedDoc) {
+  const foundDoc = await Doc.findOne({ actorId });
+  if (!foundDoc) {
     /**
      * @typedef {Object} Doc
      * @property {string} text - 내용
@@ -128,20 +130,25 @@ io.of('/doc').on('connection', async (socket) => {
       doc.version = new Automerge.Counter(0);
     });
 
-    socket.emit('sendCurrentDocData', { data: { text: doc.text.toString(), version: doc.version.value } });
+    /**
+     * @param {buffer} binaryDoc - doc 바이너리 데이터
+     * */
+    const binaryDoc = Buffer.from(Automerge.save(doc));
 
-    // 문서 정보 저장
-    await redis.client.set(Automerge.getActorId(doc), JSON.stringify({ text: doc.text.toString(), version: doc.version.value }));
+    socket.emit('sendCurrentDocData', { data: binaryDoc });
+
+    // doc 바이너리 데이터 저장
+    await Doc.create({ actorId, data: binaryDoc });
   } else {
-    socket.emit('sendCurrentDocData', { data: { text: JSON.parse(cachedDoc).text, version: JSON.parse(cachedDoc).version } });
+    socket.emit('sendCurrentDocData', { data: foundDoc.data });
   }
 
   // 현재 문서 정보 조회 listener
   socket.on('getCurrentDocInfo', async () => {
     if (verifyToken(socket.handshake.query.token)) {
-      const cachedDoc = await redis.client.get(actorId);
+      const foundDoc = await Doc.findOne({ actorId });
 
-      socket.emit('sendCurrentDocData', { data: { text: JSON.parse(cachedDoc).text, version: JSON.parse(cachedDoc).version } });
+      socket.emit('sendCurrentDocData', { data: foundDoc.data });
     } else {
       socket.disconnect(true);
     }
@@ -161,17 +168,14 @@ io.of('/doc').on('connection', async (socket) => {
   // 문서 문자열 삽입 & 삭제 listener
   socket.on('changeDocText', async (data) => {
     if (verifyToken(socket.handshake.query.token)) {
-      const cachedDoc = await redis.client.get(actorId);
+      const [foundDoc, user] = await Promise.all([Doc.findOne({ actorId }), User.findOne({ email: socket.user.email })]);
 
-      let currentDoc = Automerge.change(Automerge.init({ actor: actorId }), (doc) => {
-        doc.text = new Automerge.Text(JSON.parse(cachedDoc).text);
-        doc.version = new Automerge.Counter(JSON.parse(cachedDoc).version);
-      });
+      const currentDoc = Automerge.load(new Uint8Array(foundDoc.data), { actor: actorId });
 
       let changedDoc;
 
       if (data.type === 'insert') {
-        changedDoc = Automerge.change(Automerge.clone(currentDoc), (doc) => {
+        changedDoc = Automerge.change(Automerge.clone(currentDoc, { actor: actorId }), (doc) => {
           data.insertString.split('').forEach((c, idx) => {
             doc.text.insertAt(data.positionIndex + idx, c);
           });
@@ -180,7 +184,7 @@ io.of('/doc').on('connection', async (socket) => {
       }
 
       if (data.type === 'delete') {
-        changedDoc = Automerge.change(Automerge.clone(currentDoc), (doc) => {
+        changedDoc = Automerge.change(Automerge.clone(currentDoc, { actor: actorId }), (doc) => {
           for (let idx = 0; idx < data.deleteLength; idx++) {
             if (data.positionIndex - idx < 0) {
               break;
@@ -196,12 +200,36 @@ io.of('/doc').on('connection', async (socket) => {
       [changedDoc] = Automerge.applyChanges(currentDoc, changes);
 
       // 문서 정보 저장
-      await redis.client.set(
-        Automerge.getActorId(currentDoc),
-        JSON.stringify({ text: changedDoc.text.toString(), version: changedDoc.version.value }),
-      );
+      const session = await mongoose.startSession();
 
-      socket.emit('sendCurrentDocData', { data: { text: changedDoc.text.toString(), version: changedDoc.version.value } });
+      /**
+       * @param {buffer} binaryDoc = doc 바이너리 데이터
+       * */
+      const binaryDoc = Buffer.from(Automerge.save(changedDoc));
+
+      try {
+        session.startTransaction();
+
+        // 변경 사항 저장
+        await Change.create({
+          userId: user.id,
+          type: data.type,
+          insertString: data.insertString,
+          deleteLength: data.deleteLength,
+          positionIndex: data.positionIndex,
+        });
+
+        // doc 바이너리 데이터 저장
+        await Doc.updateOne({ actorId: Automerge.getActorId(changedDoc) }, { data: binaryDoc });
+
+        await session.commitTransaction();
+      } catch (err) {
+        console.log('transaction error', err);
+      } finally {
+        await session.endSession();
+      }
+
+      io.of('/doc').emit('sendCurrentDocData', { data: binaryDoc });
     } else {
       socket.disconnect(true);
     }

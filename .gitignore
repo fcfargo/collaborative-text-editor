@@ -1,2 +1,8 @@
 # environment variables file
 .env*
+
+# doc
+script.md
+
+# node_modules
+node_modules/
